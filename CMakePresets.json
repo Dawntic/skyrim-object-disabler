@@ -1,0 +1,19 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "ALL",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "generator": "Visual Studio 18 2026",
+      "architecture": "x64",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static-md",
+        "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL",
+        "ENABLE_SKYRIM_SE": "ON",
+        "ENABLE_SKYRIM_AE": "ON",
+        "ENABLE_SKYRIM_VR": "OFF"
+      }
+    }
+  ]
+}

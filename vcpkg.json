@@ -1,0 +1,15 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "objectdisable",
+  "version": "0.0.1",
+  "dependencies": [
+    "directxtk",
+    "fmt",
+    "rapidcsv",
+    "spdlog",
+    "catch2",
+    "detours",
+    "nlohmann-json"
+  ],
+  "builtin-baseline": "dddca6fa87f177e0678e2545c4b4636a44aa05bd"
+}
