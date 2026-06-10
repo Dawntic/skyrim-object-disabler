@@ -1,0 +1,1 @@
+# skyrim-object-disabler
