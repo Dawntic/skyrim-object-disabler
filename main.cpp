@@ -2,6 +2,7 @@
 #include <spdlog/sinks/basic_file_sink.h>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <SimpleIni.h>
 
 const std::string defaultListName = "Master";
@@ -9,8 +10,19 @@ std::filesystem::path basePath;
 const std::string fillerCommand = "SSG"; // stripped game func - repurpose as inline nop
 
 bool allObjectsEnabled = false;
-std::unordered_map<RE::FormID, std::vector<RE::FormID>> cellRefMap; // Cell formID, refs IDs in that cell, runtime resolved
-std::vector<RE::FormID> persistentRefs; 
+
+// Tracked refs grouped by the cell they live in (non-persistent). The value is the DESIRED enabled state
+// (false = should be disabled, the normal state for a tracked object; true = re-enabled via a toggle).
+// Keeping the desired state in memory is the core of the fix: it lets UpdatePerCell re-apply the correct
+// state when a cell finishes loading, even for refs whose cell isn't currently loaded - the engine only
+// resolves a ref pointer (LookupByID) while its cell is loaded, so we can't touch unloaded refs directly.
+std::unordered_map<RE::FormID, std::unordered_map<RE::FormID, bool>> cellRefMap; // cellID -> { refID -> enabled }
+std::unordered_map<RE::FormID, bool> persistentRefs;                              // refID -> enabled (always loaded)
+
+// One-shot enables for refs whose cell is unloaded (e.g. cleared while the player is away). Drained the
+// next time the owning cell finishes loading. Lives outside cellRefMap so it survives BuildDatabase, which
+// rebuilds cellRefMap from the (now emptied) json files after a clear.
+std::unordered_map<RE::FormID, std::vector<RE::FormID>> pendingEnable; // cellID -> refIDs to enable on load
 
 struct CachedChange {
 	RE::FormID refID; 
@@ -156,71 +168,74 @@ void PopObjectFromFile(std::string saveFileName) {
     }
 }
 
-// Iterate a specific file and run callback for each valid object
-void ForEachObjectInFile(std::string name, std::function<void(RE::TESObjectREFR*)> callback) {
-   auto file = basePath / (name + ".json");
-	
-    json jsonData;
-    if (!ReadFile(file, jsonData)) 
+// Iterate a specific file and resolve each object to its runtime ids. The callback receives the resolved
+// ref formID, the owning cell formID (0 for persistent refs / cells that no longer exist) and the live ref
+// pointer, which is null when the object's cell isn't currently loaded.
+void ForEachResolvedObject(std::string name, std::function<void(RE::FormID refID, RE::FormID cellID, RE::TESObjectREFR*)> callback) {
+	auto file = basePath / (name + ".json");
+
+	json jsonData;
+	if (!ReadFile(file, jsonData))
 		return;
 
 	auto* dataHandler = RE::TESDataHandler::GetSingleton();
-	if (dataHandler) {
-		for (const auto& fileObj : jsonData) {
-			ObjectID object;
-			if(!ObjectFromJson(fileObj, object))
-				continue;
-
-			auto formID = dataHandler->LookupFormID(object.formID, object.refMaster);
-
-			if (auto* objRef = RE::TESForm::LookupByID<RE::TESObjectREFR>(formID)) {
-				logger::debug("Found ref: {:x} | {}", object.formID, object.refMaster);
-				callback(objRef);
-			} else {
-				bool missingMaster = !(dataHandler->GetLoadedModIndex(object.refMaster).has_value() || dataHandler->GetLoadedLightModIndex(object.refMaster).has_value());            
-				bool missingCellMaster = !(dataHandler->GetLoadedModIndex(object.cellMaster).has_value() || dataHandler->GetLoadedLightModIndex(object.cellMaster).has_value());
-				auto comment = missingMaster ? "- Missing ref master file" : missingCellMaster ? "-  Missing cell master file" : "";
-				logger::debug("No valid object ref found for: {:x} | {} | {} | {}  {}", object.formID, object.refMaster, object.cellID, object.cellMaster, comment);
-				continue;
-			}
-		}
-	} else{
+	if (!dataHandler) {
 		logger::error("Invalid data handler");
 		return;
-	}  
+	}
+
+	for (const auto& fileObj : jsonData) {
+		ObjectID object;
+		if (!ObjectFromJson(fileObj, object))
+			continue;
+
+		auto refID = dataHandler->LookupFormID(object.formID, object.refMaster);
+		if (!refID) {
+			logger::debug("[ForEachResolvedObject] Invalid refID: {:x} | {}", object.formID, object.refMaster);
+			continue;
+		}
+
+		RE::FormID cellID = 0; // persistent ref, or cell master missing -> treat as persistent
+		if (!object.cellMaster.empty())
+			cellID = dataHandler->LookupFormID(object.cellID, object.cellMaster);
+
+		callback(refID, cellID, RE::TESForm::LookupByID<RE::TESObjectREFR>(refID));
+	}
 }
 
-RE::TESObjectREFR* GetFirstObjectInFile(std::string name) {
-    auto file = basePath / (name + ".json");
+// Desired enabled state of a file's first object, read from the in-memory index so it works even when the
+// object's cell isn't loaded. nullopt means the file is empty or its first object can't be resolved.
+std::optional<bool> GetFileFirstState(std::string name) {
+	auto file = basePath / (name + ".json");
 
-    json jsonData;
-    if (ReadFile(file, jsonData)) {
-		if(jsonData.empty())
-			return nullptr;
-      
-        auto* dataHandler = RE::TESDataHandler::GetSingleton();
-        if (!dataHandler) {
-            logger::error("Invalid data handler");
-            return nullptr;
-        }
-		
-		ObjectID object;
-		if(!ObjectFromJson(jsonData[0], object))
-			return nullptr;
-		
-        auto formID = dataHandler->LookupFormID(object.formID, object.refMaster);
+	json jsonData;
+	if (!ReadFile(file, jsonData) || jsonData.empty())
+		return std::nullopt;
 
-        auto* objRef = RE::TESForm::LookupByID<RE::TESObjectREFR>(formID);
-        if (!objRef) {
-			bool missingMaster = !(dataHandler->GetLoadedModIndex(object.refMaster).has_value() || dataHandler->GetLoadedLightModIndex(object.refMaster).has_value());
-			bool missingCellMaster = !(dataHandler->GetLoadedModIndex(object.cellMaster).has_value() || dataHandler->GetLoadedLightModIndex(object.cellMaster).has_value());
-			auto comment = missingMaster ? "- Missing ref master file" : missingCellMaster ? "-  Missing cell master file" : "";
-			logger::debug("No valid object ref found for: {:x} | {} | {} | {}  {}", object.formID, object.refMaster, object.cellID, object.cellMaster, comment);
-        }
-        return objRef;
-    }
+	auto* dataHandler = RE::TESDataHandler::GetSingleton();
+	if (!dataHandler) {
+		logger::error("Invalid data handler");
+		return std::nullopt;
+	}
 
-    return nullptr;
+	ObjectID object;
+	if (!ObjectFromJson(jsonData[0], object))
+		return std::nullopt;
+
+	auto refID = dataHandler->LookupFormID(object.formID, object.refMaster);
+	if (!refID)
+		return std::nullopt;
+
+	if (object.cellMaster.empty()) {
+		if (auto it = persistentRefs.find(refID); it != persistentRefs.end())
+			return it->second;
+	} else if (auto cellID = dataHandler->LookupFormID(object.cellID, object.cellMaster)) {
+		if (auto it = cellRefMap.find(cellID); it != cellRefMap.end())
+			if (auto rit = it->second.find(refID); rit != it->second.end())
+				return rit->second;
+	}
+
+	return false; // tracked objects default to disabled
 }
 
 void ClearFile(std::string saveFileName) {
@@ -231,7 +246,15 @@ void ClearFile(std::string saveFileName) {
 		return;
 	}
 
-	ForEachObjectInFile(saveFileName, EnableObj);
+	// Re-enable every object in the file. Loaded refs are enabled immediately; refs in unloaded cells are
+	// queued so they get enabled the next time their cell loads (BuildDatabase below would otherwise drop
+	// them, leaving them disabled forever).
+	ForEachResolvedObject(saveFileName, [](RE::FormID refID, RE::FormID cellID, RE::TESObjectREFR* ref) {
+		if (ref)
+			EnableObj(ref);
+		else if (cellID)
+			pendingEnable[cellID].push_back(refID);
+	});
 
 	if (!WriteFile(file, json::array()))
 		logger::error("Failed to clear file: {}", file.string());
@@ -276,18 +299,18 @@ void BuildDatabase() {
 				continue;
 			}
 
-			// persistent ref
-			if (object.cellMaster.empty()) {  
-				persistentRefs.push_back(formID);
-				continue; 
-			} 
+			// persistent ref (desired state defaults to disabled)
+			if (object.cellMaster.empty()) {
+				persistentRefs[formID] = false;
+				continue;
+			}
 
 			auto cellID = dataHandler->LookupFormID(object.cellID, object.cellMaster);
 			if (cellID)
-				cellRefMap[cellID].push_back(formID);
+				cellRefMap[cellID][formID] = false;
 			else{
 				logger::warn("[BuildDatabase] Form {} has invalid cellID: {} | {} - treating as persistent ref", object.formID, object.cellID, object.cellMaster);
-				persistentRefs.push_back(formID);   // cell gone -> fall back to load sweep
+				persistentRefs[formID] = false;   // cell gone -> fall back to load sweep
 			}
 		}
 	}
@@ -295,41 +318,62 @@ void BuildDatabase() {
 	logger::info("[BuildDatabase] Processed {} cells", cellRefMap.size());
 }
 
-// Disable every tracked ref currently in memory (used after a load/transfer completes).
-void SetAllObjectState(bool enable) {
-	for (auto& [cell, refs] : cellRefMap){
-		for (auto refID : refs){
-			if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID)){
-				if(enable){
-					EnableObj(ref);
-				} else{
-					DisableObj(ref);
-				}
-				logger::debug("[UpdatePerCell] {} ref: {} | {}", enable ? "Enabled" : "Disabled", ref->GetLocalFormID(), ref->GetFile(0) ? std::string(ref->GetFile(0)->GetFilename()) : "Null");
-			} 
-		}
-	}
-	
-	for (auto refID : persistentRefs){
-		if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID)) {
-			if (enable) {
+// Re-apply the stored desired state to every currently-loaded tracked ref, and flush any pending enables
+// that have since become loaded. Does not change desired state, so it preserves active toggles across a
+// fast travel / coc transfer.
+void ApplyAllLoaded() {
+	for (auto it = pendingEnable.begin(); it != pendingEnable.end();) {
+		std::erase_if(it->second, [](RE::FormID refID) {
+			if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID)) {
 				EnableObj(ref);
+				return true;
 			}
-			else {
-				DisableObj(ref);
-			}
-			logger::debug("[UpdatePerCell] {} persistent ref: {} | {}", enable ? "Enabled" : "Disabled", ref->GetLocalFormID(), ref->GetFile(0) ? std::string(ref->GetFile(0)->GetFilename()) : "Null");
-		}
+			return false;
+		});
+		it = it->second.empty() ? pendingEnable.erase(it) : std::next(it);
 	}
+
+	for (auto& [cell, refs] : cellRefMap)
+		for (auto& [refID, enabled] : refs)
+			if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID))
+				enabled ? EnableObj(ref) : DisableObj(ref);
+
+	for (auto& [refID, enabled] : persistentRefs)
+		if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID))
+			enabled ? EnableObj(ref) : DisableObj(ref);
+}
+
+// Set the desired state for every tracked ref, then apply it to the ones currently loaded. Unloaded refs
+// pick up the new state from cellRefMap when their cell loads (see UpdatePerCell).
+void SetAllObjectState(bool enable) {
+	for (auto& [cell, refs] : cellRefMap)
+		for (auto& [refID, enabled] : refs)
+			enabled = enable;
+
+	for (auto& [refID, enabled] : persistentRefs)
+		enabled = enable;
+
+	ApplyAllLoaded();
 }
 
 void UpdatePerCell(const RE::TESCellFullyLoadedEvent* event)
 {
-	if (auto it = cellRefMap.find(event->cell->GetFormID()); it != cellRefMap.end()) {
-		for (auto refID : it->second){
+	auto cellID = event->cell->GetFormID();
+
+	// Drain one-shot enables queued while this cell was unloaded (e.g. from a clear).
+	if (auto it = pendingEnable.find(cellID); it != pendingEnable.end()) {
+		for (auto refID : it->second)
+			if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID))
+				EnableObj(ref);
+		pendingEnable.erase(it);
+	}
+
+	// Apply the desired state for the refs tracked in this cell.
+	if (auto it = cellRefMap.find(cellID); it != cellRefMap.end()) {
+		for (auto& [refID, enabled] : it->second){
 			if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID)){
-				ref->Disable();
-				logger::debug("[UpdatePerCell] Disabling ref: {} | {}", ref->GetLocalFormID(), ref->GetFile(0) ? std::string(ref->GetFile(0)->GetFilename()) : "Null");
+				enabled ? EnableObj(ref) : DisableObj(ref);
+				logger::debug("[UpdatePerCell] {} ref: {} | {}", enabled ? "Enabled" : "Disabled", ref->GetLocalFormID(), ref->GetFile(0) ? std::string(ref->GetFile(0)->GetFilename()) : "Null");
 			} else{
 				logger::debug("[UpdatePerCell] Failed to set ref state for ref: {} | {}", refID, event->cell->GetLocalFormID());
 			}
@@ -371,11 +415,11 @@ void RunCommands(std::vector<std::string>& args, std::string& command) {
 		if (cellPlugin) { // non persistent ref
 			object.cellID = cell->GetLocalFormID();
 			object.cellMaster = std::string(cellPlugin->GetFilename());
-			cellRefMap[cell->GetFormID()].push_back(selectedObj->formID);
-		} else { // persistent ref 
+			cellRefMap[cell->GetFormID()][selectedObj->formID] = false;
+		} else { // persistent ref
 			object.cellID = 0;
 			object.cellMaster = "";
-			persistentRefs.push_back(selectedObj->formID);
+			persistentRefs[selectedObj->formID] = false;
 		}
 		SaveObjectState(object, fileName);
 
@@ -389,10 +433,23 @@ void RunCommands(std::vector<std::string>& args, std::string& command) {
             allObjectsEnabled = !allObjectsEnabled;
 			SetAllObjectState(allObjectsEnabled);
         } else { // Toggle specific file
-            if (auto first = GetFirstObjectInFile(args[1]))
-                ForEachObjectInFile(args[1], first->IsDisabled() ? EnableObj : DisableObj);
-            else
-                logger::error("Invalid object 0");
+            auto state = GetFileFirstState(args[1]);
+            if (!state) {
+                logger::error("Toggle: empty or unresolvable file: {}", args[1]);
+                return;
+            }
+
+            bool enable = !*state; // flip the file's current desired state
+            ForEachResolvedObject(args[1], [enable](RE::FormID refID, RE::FormID cellID, RE::TESObjectREFR* ref) {
+                // Update the stored desired state so unloaded refs are corrected when their cell loads...
+                if (cellID)
+                    cellRefMap[cellID][refID] = enable;
+                else
+                    persistentRefs[refID] = enable;
+                // ...and apply immediately to anything already loaded.
+                if (ref)
+                    enable ? EnableObj(ref) : DisableObj(ref);
+            });
         }
     } 
 	else if (cmd == "undo") {
@@ -407,11 +464,10 @@ void RunCommands(std::vector<std::string>& args, std::string& command) {
 			if (ref->IsDisabled()) 
 				ref->Enable(false);
 
-		std::erase(persistentRefs, item.refID);
+		persistentRefs.erase(item.refID);
 		if (auto it = cellRefMap.find(item.cellID); it != cellRefMap.end()) {
-			auto& refList = it->second;
-			refList.erase(std::remove(refList.begin(), refList.end(), item.refID), refList.end());
-			if (refList.empty()) 
+			it->second.erase(item.refID);
+			if (it->second.empty())
 				cellRefMap.erase(it);
 		}
 
@@ -511,7 +567,7 @@ public:
 			logger::info("Game version: {}", REL::Module::get().version().string());
 			logger::info("Game Loaded - via kFinish"); //fires for coc, fast travel
 			inTransfer = false;
-			SetAllObjectState(false);
+			ApplyAllLoaded(); // re-assert current desired states for the newly loaded cells (keeps toggles)
 		}
 
 		return RE::BSEventNotifyControl::kContinue;
@@ -544,7 +600,7 @@ public:
 			PositionPlayerEventHandler::Register(); 
 		}
 
-		if (inTransfer || allObjectsEnabled) 
+		if (inTransfer)
 			return RE::BSEventNotifyControl::kContinue;
 
 		UpdatePerCell(event);
@@ -628,10 +684,13 @@ void MessageHandler(SKSE::MessagingInterface::Message* message)
 		logger::info("Game Loaded - via kPostLoadGame");
 		inTransfer = false;
 		allObjectsEnabled = false;
+		pendingEnable.clear();
 		SetAllObjectState(false);
-	} 
+	}
 	else if(message->type == SKSE::MessagingInterface::kPreLoadGame || message->type == SKSE::MessagingInterface::kNewGame){
 		inTransfer = true;
+		allObjectsEnabled = false;
+		pendingEnable.clear();
 	}
 }
 
