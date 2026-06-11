@@ -2,16 +2,15 @@
 #include <spdlog/sinks/basic_file_sink.h>
 #include <filesystem>
 #include <fstream>
+#include <SimpleIni.h>
 
-// Add a debug mode so logger::debug is written otherwise dont write it 
-// CALLING CLEAR SHOULD reenable everything too
+const std::string defaultListName = "Master";
+std::filesystem::path basePath;
+const std::string fillerCommand = "SSG"; // stripped game func - repurpose as inline nop
 
-// disabled items in save file stayed disabled without needing to disable on player load..
-
-std::string defaultListName = "Master";
-// Cell formID, refs IDs in that cell
-std::unordered_map<RE::FormID, std::vector<RE::FormID>> cellRefMap;
-std::vector<RE::FormID> persistentRefs;   // always-loaded refs, disabled at load (no cell key possible)
+bool allObjectsEnabled = false;
+std::unordered_map<RE::FormID, std::vector<RE::FormID>> cellRefMap; // Cell formID, refs IDs in that cell, runtime resolved
+std::vector<RE::FormID> persistentRefs; 
 
 struct CachedChange {
 	RE::FormID refID; 
@@ -19,7 +18,6 @@ struct CachedChange {
 	std::string list; 
 };
 std::vector<CachedChange> cachedChanges;
-
 
 struct ObjectID 
 {
@@ -29,12 +27,6 @@ struct ObjectID
 	std::string cellMaster;
 };
 
-
-
-std::filesystem::path basePath;
-
-bool allObjectsEnabled = false;
-std::string fillerCommand = "SSG"; // stripped game func - repurpose as inline nop
 
 //// File ops ////////////////////////////////////////////////////////////////////////////
 
@@ -49,7 +41,7 @@ bool ObjectFromJson(const json& data, ObjectID& object)
 	std::from_chars(hexRefID.data(), hexRefID.data() + hexRefID.size(), object.formID, 16);
 
 	auto hexCellID = data[1].get<std::string>();
-	std::from_chars(hexCellID.data(), hexCellID.data() + hexCellID.size(), object.formID, 16);
+	std::from_chars(hexCellID.data(), hexCellID.data() + hexCellID.size(), object.cellID, 16);
 
 	object.refMaster = data[2].get<std::string>();
 	object.cellMaster = data[3].get<std::string>();
@@ -97,31 +89,10 @@ bool WriteFile(std::filesystem::path& file, json data) {
 	return true;
 }
 
-void ClearFile(std::string saveFileName) {
-    auto file = basePath / (saveFileName + ".json");
-
-    if (!std::filesystem::exists(file)) {
-        logger::error("ClearObjectFile: file not found: {}", file.string());
-        return;
-    }
-
-    if(!WriteFile(file, json::array()))
-        logger::info("Failed to clear file: {}", file.string());
-}
-
-void ClearAllFiles() {
-    std::error_code ec;
-    for (const auto& file : std::filesystem::directory_iterator(basePath, ec)) {
-        if (file.is_regular_file() && file.path().extension() == ".json") {
-            ClearFile(file.path().stem().string());
-        }
-    }
-}
-
 void BackupAllFiles() {
     namespace fs = std::filesystem;
 
-    auto filePath = basePath.parent_path() / ("DisabledObjects_Backup");
+    auto filePath = basePath / ("DisabledObjects_Backup");
 
 	std::error_code errorCode;
 	if(!fs::is_directory(filePath)){
@@ -157,15 +128,15 @@ void SaveObjectState(const ObjectID& object, std::string saveFileName) {
 
 	json data;
 	if (!ReadFile(file, data)) {
-		if (!std::filesystem::exists(file)) 
+		if (!std::filesystem::exists(file)) {
+			logger::info("Creating file: {}", file.string());
 			data = json::array();
-		else { 
+		} else { 
 			logger::error("[SaveObjectState] Failed to read current list"); 
 			return;
 		}
 	}
 
-	// [refLocalHex, refMod, cellLocalHex, cellMod]
 	auto encoded = json::array({ std::format("{:X}", object.formID), std::format("{:X}", object.cellID), object.refMaster, object.cellMaster });
 	data.push_back(encoded);
 
@@ -190,32 +161,33 @@ void ForEachObjectInFile(std::string name, std::function<void(RE::TESObjectREFR*
    auto file = basePath / (name + ".json");
 	
     json jsonData;
-    if (ReadFile(file, jsonData)) {
-		//logger::info("Read file");
-        for (const auto& fileObj : jsonData) {
-            auto* dataHandler = RE::TESDataHandler::GetSingleton();
-            if (!dataHandler) {
-                logger::error("Invalid data handler");
-                return;
-            }
+    if (!ReadFile(file, jsonData)) 
+		return;
 
+	auto* dataHandler = RE::TESDataHandler::GetSingleton();
+	if (dataHandler) {
+		for (const auto& fileObj : jsonData) {
 			ObjectID object;
 			if(!ObjectFromJson(fileObj, object))
-				return;
+				continue;
 
-            auto formID = dataHandler->LookupFormID(object.formID, object.cellMaster);
+			auto formID = dataHandler->LookupFormID(object.formID, object.refMaster);
 
-            if (auto* objRef = RE::TESForm::LookupByID<RE::TESObjectREFR>(formID)) {
-				logger::debug("Found ref: {:x} | {}", object.formID, object.cellMaster);
-                callback(objRef);
-            } else {
+			if (auto* objRef = RE::TESForm::LookupByID<RE::TESObjectREFR>(formID)) {
+				logger::debug("Found ref: {:x} | {}", object.formID, object.refMaster);
+				callback(objRef);
+			} else {
 				bool missingMaster = !(dataHandler->GetLoadedModIndex(object.refMaster).has_value() || dataHandler->GetLoadedLightModIndex(object.refMaster).has_value());            
 				bool missingCellMaster = !(dataHandler->GetLoadedModIndex(object.cellMaster).has_value() || dataHandler->GetLoadedLightModIndex(object.cellMaster).has_value());
 				auto comment = missingMaster ? "- Missing ref master file" : missingCellMaster ? "-  Missing cell master file" : "";
 				logger::debug("No valid object ref found for: {:x} | {} | {} | {}  {}", object.formID, object.refMaster, object.cellID, object.cellMaster, comment);
-            }
-        }
-    }
+				continue;
+			}
+		}
+	} else{
+		logger::error("Invalid data handler");
+		return;
+	}  
 }
 
 RE::TESObjectREFR* GetFirstObjectInFile(std::string name) {
@@ -251,14 +223,27 @@ RE::TESObjectREFR* GetFirstObjectInFile(std::string name) {
     return nullptr;
 }
 
-// set state of all objects
-void SetForEachFile(bool enable) {
-    std::error_code ec;
-    for (const auto& file : std::filesystem::directory_iterator(basePath, ec)) {
-        if (file.is_regular_file() && file.path().extension() == ".json")
-            ForEachObjectInFile(file.path().stem().string(), enable ? EnableObj : DisableObj);
-    }
-    allObjectsEnabled = enable;
+void ClearFile(std::string saveFileName) {
+	auto file = basePath / (saveFileName + ".json");
+
+	if (!std::filesystem::exists(file)) {
+		logger::error("ClearObjectFile: file not found: {}", file.string());
+		return;
+	}
+
+	ForEachObjectInFile(saveFileName, EnableObj);
+
+	if (!WriteFile(file, json::array()))
+		logger::error("Failed to clear file: {}", file.string());
+}
+
+void ClearAllFiles() {
+	std::error_code ec;
+	for (const auto& file : std::filesystem::directory_iterator(basePath, ec)) {
+		if (file.is_regular_file() && file.path().extension() == ".json") {
+			ClearFile(file.path().stem().string());
+		}
+	}
 }
 
 // Combine json files into one place
@@ -275,6 +260,7 @@ void BuildDatabase() {
 	for (const auto& entry : std::filesystem::directory_iterator(basePath, error)) {
 		if (!entry.is_regular_file() || entry.path().extension() != ".json") 
 			continue;
+
 		json data;
 		if (!ReadFile(entry.path(), data)) 
 			continue;
@@ -282,7 +268,7 @@ void BuildDatabase() {
 		for (const auto& item : data) {
 			ObjectID object;
 			if(!ObjectFromJson(item, object))
-				return;
+				continue;
 
 			auto formID = dataHandler->LookupFormID(object.formID, object.refMaster);
 			if (!formID){
@@ -306,24 +292,48 @@ void BuildDatabase() {
 		}
 	}
 
-	logger::info("BuildDatabase: {} cells, {} persistent", cellRefMap.size(), persistentRefs.size());
+	logger::info("[BuildDatabase] Processed {} cells", cellRefMap.size());
 }
 
 // Disable every tracked ref currently in memory (used after a load/transfer completes).
-void ApplyAllLoaded() {
-	if (allObjectsEnabled) 
-		return;
-
+void SetAllObjectState(bool enable) {
 	for (auto& [cell, refs] : cellRefMap){
 		for (auto refID : refs){
-			if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID))
-				ref->Disable();
+			if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID)){
+				if(enable){
+					EnableObj(ref);
+				} else{
+					DisableObj(ref);
+				}
+				logger::debug("[UpdatePerCell] {} ref: {} | {}", enable ? "Enabled" : "Disabled", ref->GetLocalFormID(), ref->GetFile(0) ? std::string(ref->GetFile(0)->GetFilename()) : "Null");
+			} 
 		}
 	}
 	
 	for (auto refID : persistentRefs){
-		if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID))
-			ref->Disable();
+		if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID)) {
+			if (enable) {
+				EnableObj(ref);
+			}
+			else {
+				DisableObj(ref);
+			}
+			logger::debug("[UpdatePerCell] {} persistent ref: {} | {}", enable ? "Enabled" : "Disabled", ref->GetLocalFormID(), ref->GetFile(0) ? std::string(ref->GetFile(0)->GetFilename()) : "Null");
+		}
+	}
+}
+
+void UpdatePerCell(const RE::TESCellFullyLoadedEvent* event)
+{
+	if (auto it = cellRefMap.find(event->cell->GetFormID()); it != cellRefMap.end()) {
+		for (auto refID : it->second){
+			if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID)){
+				ref->Disable();
+				logger::debug("[UpdatePerCell] Disabling ref: {} | {}", ref->GetLocalFormID(), ref->GetFile(0) ? std::string(ref->GetFile(0)->GetFilename()) : "Null");
+			} else{
+				logger::debug("[UpdatePerCell] Failed to set ref state for ref: {} | {}", refID, event->cell->GetLocalFormID());
+			}
+		}
 	}
 }
 /////////////////////////////////////////////////////////////////////////////////////////
@@ -377,7 +387,7 @@ void RunCommands(std::vector<std::string>& args, std::string& command) {
         command = fillerCommand;
         if (args.size() < 2) { // Toggle all
             allObjectsEnabled = !allObjectsEnabled;
-            SetForEachFile(allObjectsEnabled);
+			SetAllObjectState(allObjectsEnabled);
         } else { // Toggle specific file
             if (auto first = GetFirstObjectInFile(args[1]))
                 ForEachObjectInFile(args[1], first->IsDisabled() ? EnableObj : DisableObj);
@@ -411,8 +421,12 @@ void RunCommands(std::vector<std::string>& args, std::string& command) {
 	}
 	else if (cmd == "clear") {
 		command = fillerCommand;
-		if (args.size() < 2) { BackupAllFiles(); ClearAllFiles(); }
-		else ClearFile(args[1]);
+		if (args.size() < 2) { 
+			BackupAllFiles(); 
+			ClearAllFiles(); 
+		}
+		else
+			ClearFile(args[1]);
 		BuildDatabase();   // index now reflects the cleared files
 	}
     else {
@@ -487,17 +501,17 @@ class PositionPlayerEventHandler : public RE::BSTEventSink<RE::PositionPlayerEve
 {
 public:
 	virtual RE::BSEventNotifyControl ProcessEvent(const RE::PositionPlayerEvent* a_event, RE::BSTEventSource<RE::PositionPlayerEvent>*) {
-		logger::info("Player Pos Event msg: {}", a_event->type.underlying());
+		//logger::info("Player Pos Event msg: {}", a_event->type.underlying());
 
 		if (a_event && a_event->type == RE::PositionPlayerEvent::EVENT_TYPE::kPre) {
 			inTransfer = true;
 		}
 		
-		if (a_event && a_event->type == RE::PositionPlayerEvent::EVENT_TYPE::kFinish) { // firest post cell loading
-			logger::info("Game Loaded"); //fires for coc, fast travel
+		if (a_event && a_event->type == RE::PositionPlayerEvent::EVENT_TYPE::kFinish) { // first post cell loading
+			logger::info("Game version: {}", REL::Module::get().version().string());
+			logger::info("Game Loaded - via kFinish"); //fires for coc, fast travel
 			inTransfer = false;
-			//SetForEachFile(false);
-			ApplyAllLoaded();
+			SetAllObjectState(false);
 		}
 
 		return RE::BSEventNotifyControl::kContinue;
@@ -520,22 +534,20 @@ public:
 class CellFullyLoadedEventHandler : public RE::BSTEventSink<RE::TESCellFullyLoadedEvent>
 {
 public:
-	virtual RE::BSEventNotifyControl ProcessEvent(const RE::TESCellFullyLoadedEvent* a_event, RE::BSTEventSource<RE::TESCellFullyLoadedEvent>*) {
-		if (!a_event || !a_event->cell) return RE::BSEventNotifyControl::kContinue;
+	virtual RE::BSEventNotifyControl ProcessEvent(const RE::TESCellFullyLoadedEvent* event, RE::BSTEventSource<RE::TESCellFullyLoadedEvent>*) {
+		if (!event || !event->cell) 
+			return RE::BSEventNotifyControl::kContinue;
 
-		static bool init = true;
-		if (init) {
-			init = false; PositionPlayerEventHandler::Register(); 
+		static bool first = true;
+		if (first && RE::PlayerCharacter::GetSingleton()) {
+			first = false;
+			PositionPlayerEventHandler::Register(); 
 		}
 
 		if (inTransfer || allObjectsEnabled) 
 			return RE::BSEventNotifyControl::kContinue;
 
-		if (auto it = cellRefMap.find(a_event->cell->GetFormID()); it != cellRefMap.end()) {
-			for (auto refID : it->second)
-				if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID))
-					ref->Disable();
-		}
+		UpdatePerCell(event);
 
 		return RE::BSEventNotifyControl::kContinue;
 	}
@@ -556,16 +568,34 @@ public:
 
 //// Setup //////////////////////////////////////////////////////////////////////////////
 
+bool LoadDebugSetting() {
+	auto path = std::filesystem::current_path() / "Data" / "SKSE" / "Plugins" / std::format("{}.ini", SKSE::PluginDeclaration::GetSingleton()->GetName());
+
+	CSimpleIniA ini;
+	ini.SetUnicode();
+	ini.LoadFile(path.string().c_str());                 // missing file -> ini just stays empty
+
+	bool debug = ini.GetBoolValue("Debug", "EnableDebugLog", false);
+
+	// write the key back: creates the file with the default if absent, preserves user edits otherwise
+	ini.SetBoolValue("Debug", "EnableDebugLog", debug);
+	ini.SaveFile(path.string().c_str());
+
+	return debug;
+}
+
 void SetupLogger() {
-    auto path = *logger::log_directory();
-    path /= std::format("{}.txt", SKSE::PluginDeclaration::GetSingleton()->GetName());
+	auto path = *logger::log_directory();
+	path /= std::format("{}.txt", SKSE::PluginDeclaration::GetSingleton()->GetName());
 
-    auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(path.string(), true);
-    auto loggerPtr = std::make_shared<spdlog::logger>("log", std::move(sink));
+	auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(path.string(), true);
+	auto loggerPtr = std::make_shared<spdlog::logger>("log", std::move(sink));
 
-    spdlog::set_level(spdlog::level::info);
-    spdlog::flush_on(spdlog::level::info);
-    spdlog::set_default_logger(std::move(loggerPtr));
+	auto level = LoadDebugSetting() ? spdlog::level::debug : spdlog::level::info;
+	loggerPtr->set_level(level);
+	loggerPtr->flush_on(level);
+
+	spdlog::set_default_logger(std::move(loggerPtr));
 }
 
 
@@ -588,14 +618,17 @@ void MessageHandler(SKSE::MessagingInterface::Message* message)
 
 		logger::info("Base folder location: {}", basePath.lexically_relative(std::filesystem::current_path()).string());
 
+		// Register here since player ptr will be valid
 		CellFullyLoadedEventHandler::Register();	
 
         Hooks::Install();
     }
 	else if (message->type == SKSE::MessagingInterface::kPostLoadGame) {
 		logger::info("Game version: {}", REL::Module::get().version().string());
-		logger::info("Game Loaded");
-		SetForEachFile(false);
+		logger::info("Game Loaded - via kPostLoadGame");
+		inTransfer = false;
+		allObjectsEnabled = false;
+		SetAllObjectState(false);
 	} 
 	else if(message->type == SKSE::MessagingInterface::kPreLoadGame || message->type == SKSE::MessagingInterface::kNewGame){
 		inTransfer = true;
