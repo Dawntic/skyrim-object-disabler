@@ -3,7 +3,7 @@
 #include <filesystem>
 #include <fstream>
 
-
+// Add a debug mode so logger::debug is written otherwise dont write it 
 // CALLING CLEAR SHOULD reenable everything too
 
 // disabled items in save file stayed disabled without needing to disable on player load..
@@ -20,11 +20,16 @@ struct CachedChange {
 };
 std::vector<CachedChange> cachedChanges;
 
-static RE::FormID ParseHex(const std::string& s) {
-	RE::FormID id = 0;
-	std::from_chars(s.data(), s.data() + s.size(), id, 16);
-	return id;
-}
+
+struct ObjectID 
+{
+	RE::FormID formID; // base form ID
+	RE::FormID cellID;
+	std::string refMaster; // esp/esm ref comes from
+	std::string cellMaster;
+};
+
+
 
 std::filesystem::path basePath;
 
@@ -32,6 +37,25 @@ bool allObjectsEnabled = false;
 std::string fillerCommand = "SSG"; // stripped game func - repurpose as inline nop
 
 //// File ops ////////////////////////////////////////////////////////////////////////////
+
+bool ObjectFromJson(const json& data, ObjectID& object)
+{
+	if (!data.is_array() || data.size() != 4){
+		logger::error("[LoadObjectFromJson] Malformed object data");
+		return false;
+	}
+
+	auto hexRefID = data[0].get<std::string>();
+	std::from_chars(hexRefID.data(), hexRefID.data() + hexRefID.size(), object.formID, 16);
+
+	auto hexCellID = data[1].get<std::string>();
+	std::from_chars(hexCellID.data(), hexCellID.data() + hexCellID.size(), object.formID, 16);
+
+	object.refMaster = data[2].get<std::string>();
+	object.cellMaster = data[3].get<std::string>();
+
+	return true;
+}
 
 bool ReadFile(std::filesystem::path path, nlohmann::json& jsonData) 
 {
@@ -151,21 +175,25 @@ void SaveObjectState(RE::FormID localID, std::string_view modName, std::string s
 }
 */
 
-void SaveObjectState(RE::FormID refLocal, std::string_view refMod, RE::FormID cellLocal, std::string_view cellMod, std::string saveFileName) {
+void SaveObjectState(const ObjectID& object, std::string saveFileName) {
 	auto file = basePath / (saveFileName + ".json");
 
 	json data;
 	if (!ReadFile(file, data)) {
-		if (!std::filesystem::exists(file)) data = json::array();
-		else { logger::error("[SaveObjectState] Failed to read current list"); return; }
+		if (!std::filesystem::exists(file)) 
+			data = json::array();
+		else { 
+			logger::error("[SaveObjectState] Failed to read current list"); 
+			return;
+		}
 	}
 
 	// [refLocalHex, refMod, cellLocalHex, cellMod]
-	auto encoded = json::array({ std::format("{:X}", refLocal), std::string(refMod), std::format("{:X}", cellLocal), std::string(cellMod) });
+	auto encoded = json::array({ std::format("{:X}", object.formID), std::format("{:X}", object.cellID), object.refMaster, object.cellMaster });
 	data.push_back(encoded);
 
 	if (!WriteFile(file, data))
-		logger::error("Failed to save object to file: {}", file.string());
+		logger::error("[SaveObjectState] Failed to save object to file: {}", file.string());
 }
 
 // drop the last element for a given file
@@ -187,28 +215,27 @@ void ForEachObjectInFile(std::string name, std::function<void(RE::TESObjectREFR*
     json jsonData;
     if (ReadFile(file, jsonData)) {
 		//logger::info("Read file");
-        for (const auto& item : jsonData) {
+        for (const auto& fileObj : jsonData) {
             auto* dataHandler = RE::TESDataHandler::GetSingleton();
             if (!dataHandler) {
-                logger::info("Invalid data handler");
+                logger::error("Invalid data handler");
                 return;
             }
-            RE::FormID localFormID;
-            auto formIDHex = item[0].get<std::string>();
-            std::from_chars(formIDHex.data(), formIDHex.data() + formIDHex.size(), localFormID, 16);
 
-            auto modName = item[1].get<std::string>();
-            auto formID = dataHandler->LookupFormID(localFormID, modName);
+			ObjectID object;
+			if(!ObjectFromJson(fileObj, object))
+				return;
 
-			//bool missingMasterA = !(dataHandler->GetLoadedModIndex(modName).has_value() || dataHandler->GetLoadedLightModIndex(modName).has_value());
-			//logger::error("Missing Master: {}", missingMasterA ? modName : "False");
+            auto formID = dataHandler->LookupFormID(object.formID, object.cellMaster);
 
             if (auto* objRef = RE::TESForm::LookupByID<RE::TESObjectREFR>(formID)) {
-				logger::info("Found ref: {:x} | {}", localFormID, modName);
+				logger::debug("Found ref: {:x} | {}", object.formID, object.cellMaster);
                 callback(objRef);
             } else {
-				bool missingMaster = !(dataHandler->GetLoadedModIndex(modName).has_value() || dataHandler->GetLoadedLightModIndex(modName).has_value());            
-				logger::error("No valid object ref found for: {:x} | {} {}", localFormID, modName, missingMaster ? "  - Missing master file" : "");
+				bool missingMaster = !(dataHandler->GetLoadedModIndex(object.refMaster).has_value() || dataHandler->GetLoadedLightModIndex(object.refMaster).has_value());            
+				bool missingCellMaster = !(dataHandler->GetLoadedModIndex(object.cellMaster).has_value() || dataHandler->GetLoadedLightModIndex(object.cellMaster).has_value());
+				auto comment = missingMaster ? "- Missing ref master file" : missingCellMaster ? "-  Missing cell master file" : "";
+				logger::debug("No valid object ref found for: {:x} | {} | {} | {}  {}", object.formID, object.refMaster, object.cellID, object.cellMaster, comment);
             }
         }
     }
@@ -224,22 +251,22 @@ RE::TESObjectREFR* GetFirstObjectInFile(std::string name) {
       
         auto* dataHandler = RE::TESDataHandler::GetSingleton();
         if (!dataHandler) {
-            logger::info("Invalid data handler");
+            logger::error("Invalid data handler");
             return nullptr;
         }
 		
-		auto& first = jsonData[0];
-        RE::FormID localFormID;
-        auto formIDHex = first[0].get<std::string>();
-        std::from_chars(formIDHex.data(), formIDHex.data() + formIDHex.size(), localFormID, 16);
-
-        auto modName = first[1].get<std::string>();
-        auto formID = dataHandler->LookupFormID(localFormID, modName);
+		ObjectID object;
+		if(!ObjectFromJson(jsonData[0], object))
+			return nullptr;
+		
+        auto formID = dataHandler->LookupFormID(object.formID, object.refMaster);
 
         auto* objRef = RE::TESForm::LookupByID<RE::TESObjectREFR>(formID);
         if (!objRef) {
-            bool missingMaster = !(dataHandler->GetLoadedModIndex(modName).has_value() || dataHandler->GetLoadedLightModIndex(modName).has_value());
-            logger::error("No valid object ref found for: {:x} | {} {}", localFormID, modName, missingMaster ? "  - Mod is missing a master" : "");
+			bool missingMaster = !(dataHandler->GetLoadedModIndex(object.refMaster).has_value() || dataHandler->GetLoadedLightModIndex(object.refMaster).has_value());
+			bool missingCellMaster = !(dataHandler->GetLoadedModIndex(object.cellMaster).has_value() || dataHandler->GetLoadedLightModIndex(object.cellMaster).has_value());
+			auto comment = missingMaster ? "- Missing ref master file" : missingCellMaster ? "-  Missing cell master file" : "";
+			logger::debug("No valid object ref found for: {:x} | {} | {} | {}  {}", object.formID, object.refMaster, object.cellID, object.cellMaster, comment);
         }
         return objRef;
     }
@@ -257,19 +284,18 @@ void SetForEachFile(bool enable) {
     allObjectsEnabled = enable;
 }
 
-
-// Rebuild cell->refs index from all list files. Call once per session, after data load.
+// Combine json files into one place
 void BuildDatabase() {
 	cellRefMap.clear();
 	persistentRefs.clear();
-	auto* dh = RE::TESDataHandler::GetSingleton();
-	if (!dh) { 
+	auto* dataHandler = RE::TESDataHandler::GetSingleton();
+	if (!dataHandler) { 
 		logger::error("BuildDatabase: no data handler"); 
 		return; 
 	}
 
-	std::error_code ec;
-	for (const auto& entry : std::filesystem::directory_iterator(basePath, ec)) {
+	std::error_code error;
+	for (const auto& entry : std::filesystem::directory_iterator(basePath, error)) {
 		if (!entry.is_regular_file() || entry.path().extension() != ".json") 
 			continue;
 		json data;
@@ -277,25 +303,32 @@ void BuildDatabase() {
 			continue;
 
 		for (const auto& item : data) {
-			if (!item.is_array() || item.size() < 4) 
-				continue;
-			auto refID = dh->LookupFormID(ParseHex(item[0].get<std::string>()), item[1].get<std::string>());
-			if (!refID) 
-				continue;
+			ObjectID object;
+			if(!ObjectFromJson(item, object))
+				return;
 
-			auto cellMod = item[3].get<std::string>();
-			if (cellMod.empty()) { 
-				persistentRefs.push_back(refID);
+			auto formID = dataHandler->LookupFormID(object.formID, object.refMaster);
+			if (!formID){
+				logger::error("[BuildDatabase] Invalid formID: {} | {}", object.formID, object.refMaster);
+				continue;
+			}
+
+			// persistent ref
+			if (object.cellMaster.empty()) {  
+				persistentRefs.push_back(formID);
 				continue; 
-			}   // persistent
+			} 
 
-			auto cellID = dh->LookupFormID(ParseHex(item[2].get<std::string>()), cellMod);
+			auto cellID = dataHandler->LookupFormID(object.cellID, object.cellMaster);
 			if (cellID)
-				cellRefMap[cellID].push_back(refID);
-			else       
-				persistentRefs.push_back(refID);   // cell gone -> fall back to load sweep
+				cellRefMap[cellID].push_back(formID);
+			else{
+				logger::warn("[BuildDatabase] Form {} has invalid cellID: {} | {} - treating as persistent ref", object.formID, object.cellID, object.cellMaster);
+				persistentRefs.push_back(formID);   // cell gone -> fall back to load sweep
+			}
 		}
 	}
+
 	logger::info("BuildDatabase: {} cells, {} persistent", cellRefMap.size(), persistentRefs.size());
 }
 
@@ -370,15 +403,18 @@ void RunCommands(std::vector<std::string>& args, std::string& command) {
 
 		auto* cell = selectedObj->GetParentCell();
 		auto* cellPlugin = cell ? cell->GetFile(0) : nullptr;
-
-		if (cellPlugin) {                                   // non persistent ref
-			SaveObjectState(selectedObj->GetLocalFormID(), basePlugin->GetFilename(), cell->GetLocalFormID(), cellPlugin->GetFilename(), fileName);
+		
+		ObjectID object = { .formID = selectedObj->GetLocalFormID(), .refMaster = std::string(basePlugin->GetFilename()) }; 
+		if (cellPlugin) { // non persistent ref
+			object.cellID = cell->GetLocalFormID();
+			object.cellMaster = std::string(cellPlugin->GetFilename());
 			cellRefMap[cell->GetFormID()].push_back(selectedObj->formID);
-		}
-		else {                                            // persistent ref - always loaded
-			SaveObjectState(selectedObj->GetLocalFormID(), basePlugin->GetFilename(), 0, "", fileName);  // empty cell mod = persistent marker
+		} else { // persistent ref 
+			object.cellID = 0;
+			object.cellMaster = "";
 			persistentRefs.push_back(selectedObj->formID);
 		}
+		SaveObjectState(object, fileName);
 
 		if (cachedChanges.size() == 10) 
 			cachedChanges.erase(cachedChanges.begin());
