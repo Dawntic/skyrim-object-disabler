@@ -152,29 +152,6 @@ void BackupAllFiles() {
 void DisableObj(RE::TESObjectREFR* ref) { ref->Disable(); }
 void EnableObj(RE::TESObjectREFR* ref) { ref->Enable(false); }
 
-/*
-void SaveObjectState(RE::FormID localID, std::string_view modName, std::string saveFileName) {
-    auto file = basePath / (std::string(saveFileName) + ".json");
-
-    json data;
-    if (!ReadFile(file, data)) {
-		if (!std::filesystem::exists(file)) {
-			logger::info("Creating file: {}", file.string());
-			data = json::array();
-		} else {
-			logger::error("[SaveObjectState] Failed to read current list");
-			return;
-		}
-    }
-
-    // store [formID, modName] in array format
-    data.push_back(json::array({std::format("{:X}", localID), std::string(modName)}));
-
-    if (!WriteFile(file, data)) 
-		logger::error("Failed to save object to file: {}", file.string());
-}
-*/
-
 void SaveObjectState(const ObjectID& object, std::string saveFileName) {
 	auto file = basePath / (saveFileName + ".json");
 
@@ -357,31 +334,7 @@ void ApplyAllLoaded() {
 
 void RunCommands(std::vector<std::string>& args, std::string& command) {
     const auto& cmd = args[0];
-	/*
-    if (cmd == "p") {
-        command = "disable";
-        auto selectedObj = RE::Console::GetSelectedRef();
-        if (!selectedObj) {
-            logger::warn("No object selected");
-            return;
-        }
 
-        auto fileName = defaultListName;
-        if (args.size() >= 3 && args[1] == "n") 
-            fileName = args[2];
-
-        auto* basePlugin = selectedObj->GetFile(0); // The base esm/esp/esl
-        if (!basePlugin) {
-            logger::warn("Dynamic ref, skipping"); // Does this happen?
-            return;
-        }
-
-        SaveObjectState(selectedObj->GetLocalFormID(), basePlugin->GetFilename(), fileName);
-        if (cachedChanges.size() == 10)
-            cachedChanges.erase(cachedChanges.begin());
-        cachedChanges.push_back({selectedObj->formID, fileName});
-    } 
-	*/
 	if (cmd == "p") {
 		command = "disable";
 		auto selectedObj = RE::Console::GetSelectedRef();
@@ -432,30 +385,6 @@ void RunCommands(std::vector<std::string>& args, std::string& command) {
                 logger::error("Invalid object 0");
         }
     } 
-	/*
-    else if (cmd == "undo") {
-        command = fillerCommand;
-        if (cachedChanges.empty()) {
-            logger::error("Nothing to undo");
-            return;
-        }
-        auto item = cachedChanges.back();
-        if (auto* objRef = RE::TESForm::LookupByID<RE::TESObjectREFR>(item.first))
-            if (objRef->IsDisabled())
-                objRef->Enable(false);  
-        if (!item.second.empty()) PopObjectFromFile(item.second);
-        cachedChanges.pop_back();
-    } 
-    else if (cmd == "clear") {
-        command = fillerCommand;
-        if (args.size() < 2) {  
-            BackupAllFiles();
-            ClearAllFiles();
-        }
-        else
-            ClearFile(args[1]);
-    }
-	*/
 	else if (cmd == "undo") {
 		command = fillerCommand;
 		if (cachedChanges.empty()) { 
@@ -515,15 +444,6 @@ struct Hooks
                         args.emplace_back(tok);  // not flags
                     }
                 }
-				/*
-                if (args.empty()) {
-                     if (auto sel = RE::Console::GetSelectedRef()) {
-                         if (cachedChanges.size() == 10) 
-                             cachedChanges.erase(cachedChanges.begin());
-                         cachedChanges.push_back({sel->formID, ""});
-                     }
-                 } 
-				 */
 				if (args.empty()) {
 					if (auto sel = RE::Console::GetSelectedRef()) {
 						auto* cell = sel->GetParentCell();
@@ -600,26 +520,6 @@ public:
 class CellFullyLoadedEventHandler : public RE::BSTEventSink<RE::TESCellFullyLoadedEvent>
 {
 public:
-/*
-	virtual RE::BSEventNotifyControl ProcessEvent(const RE::TESCellFullyLoadedEvent* a_event, RE::BSTEventSource<RE::TESCellFullyLoadedEvent>*) {
-		logger::info("Cell fully loaded msg");
-		
-		static bool init = true;
-		if (a_event && a_event->cell){ // && a_event->cell->GetRuntimeData().loadedData->refsFullyLoaded) {
-			if(init) {
-				init = false;
-				logger::info("Register Position Player Event");
-				PositionPlayerEventHandler::Register(); 
-			} 
-			if(!inTransfer) {
-				logger::info("Setting base object state - CellFullyLoadedEventHandler");
-				SetForEachFile(false);
-			}
-		}
-
-		return RE::BSEventNotifyControl::kContinue;
-	}
-	*/
 	virtual RE::BSEventNotifyControl ProcessEvent(const RE::TESCellFullyLoadedEvent* a_event, RE::BSTEventSource<RE::TESCellFullyLoadedEvent>*) {
 		if (!a_event || !a_event->cell) return RE::BSEventNotifyControl::kContinue;
 
@@ -701,34 +601,6 @@ void MessageHandler(SKSE::MessagingInterface::Message* message)
 		inTransfer = true;
 	}
 }
-
-// Rubbish PROBS
-/*
-void MessageHandler(SKSE::MessagingInterface::Message* message) {
-	switch (message->type) {
-	case SKSE::MessagingInterface::kPostPostLoad:
-		basePath = std::filesystem::current_path() / "Data" / "SKSE" / "Plugins" / "DisabledObjects";
-		if (!std::filesystem::is_directory(basePath)) std::filesystem::create_directories(basePath);
-		CellFullyLoadedEventHandler::Register();
-		Hooks::Install();
-		break;
-
-	case SKSE::MessagingInterface::kDataLoaded:
-		BuildDatabase();              // load order is fixed now; index valid for the whole session
-		break;
-
-	case SKSE::MessagingInterface::kPreLoadGame:
-		inTransfer = true;            // suppress cell handler while the load streams cells
-		break;
-
-	case SKSE::MessagingInterface::kPostLoadGame:
-	case SKSE::MessagingInterface::kNewGame:
-		inTransfer = false;
-		ApplyAllLoaded();
-		break;
-	}
-}
-*/
 
 SKSEPluginInfo(.Version = REL::Version{1,0,0}, .Name = "Object Disabler", .Author = "Dawntic", .StructCompatibility = SKSE::StructCompatibility::Independent, .RuntimeCompatibility = SKSE::VersionIndependence::AddressLibrary)
 
