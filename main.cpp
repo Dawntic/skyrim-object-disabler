@@ -3,8 +3,28 @@
 #include <filesystem>
 #include <fstream>
 
+
+// CALLING CLEAR SHOULD reenable everything too
+
+// disabled items in save file stayed disabled without needing to disable on player load..
+
 std::string defaultListName = "Master";
-std::vector<std::pair<RE::FormID, std::string>> cachedChanges;
+// Cell formID, refs IDs in that cell
+std::unordered_map<RE::FormID, std::vector<RE::FormID>> cellRefMap;
+std::vector<RE::FormID> persistentRefs;   // always-loaded refs, disabled at load (no cell key possible)
+
+struct CachedChange {
+	RE::FormID refID; 
+	RE::FormID cellID;
+	std::string list; 
+};
+std::vector<CachedChange> cachedChanges;
+
+static RE::FormID ParseHex(const std::string& s) {
+	RE::FormID id = 0;
+	std::from_chars(s.data(), s.data() + s.size(), id, 16);
+	return id;
+}
 
 std::filesystem::path basePath;
 
@@ -108,6 +128,7 @@ void BackupAllFiles() {
 void DisableObj(RE::TESObjectREFR* ref) { ref->Disable(); }
 void EnableObj(RE::TESObjectREFR* ref) { ref->Enable(false); }
 
+/*
 void SaveObjectState(RE::FormID localID, std::string_view modName, std::string saveFileName) {
     auto file = basePath / (std::string(saveFileName) + ".json");
 
@@ -126,6 +147,24 @@ void SaveObjectState(RE::FormID localID, std::string_view modName, std::string s
     data.push_back(json::array({std::format("{:X}", localID), std::string(modName)}));
 
     if (!WriteFile(file, data)) 
+		logger::error("Failed to save object to file: {}", file.string());
+}
+*/
+
+void SaveObjectState(RE::FormID refLocal, std::string_view refMod, RE::FormID cellLocal, std::string_view cellMod, std::string saveFileName) {
+	auto file = basePath / (saveFileName + ".json");
+
+	json data;
+	if (!ReadFile(file, data)) {
+		if (!std::filesystem::exists(file)) data = json::array();
+		else { logger::error("[SaveObjectState] Failed to read current list"); return; }
+	}
+
+	// [refLocalHex, refMod, cellLocalHex, cellMod]
+	auto encoded = json::array({ std::format("{:X}", refLocal), std::string(refMod), std::format("{:X}", cellLocal), std::string(cellMod) });
+	data.push_back(encoded);
+
+	if (!WriteFile(file, data))
 		logger::error("Failed to save object to file: {}", file.string());
 }
 
@@ -218,6 +257,65 @@ void SetForEachFile(bool enable) {
     allObjectsEnabled = enable;
 }
 
+
+// Rebuild cell->refs index from all list files. Call once per session, after data load.
+void BuildDatabase() {
+	cellRefMap.clear();
+	persistentRefs.clear();
+	auto* dh = RE::TESDataHandler::GetSingleton();
+	if (!dh) { 
+		logger::error("BuildDatabase: no data handler"); 
+		return; 
+	}
+
+	std::error_code ec;
+	for (const auto& entry : std::filesystem::directory_iterator(basePath, ec)) {
+		if (!entry.is_regular_file() || entry.path().extension() != ".json") 
+			continue;
+		json data;
+		if (!ReadFile(entry.path(), data)) 
+			continue;
+
+		for (const auto& item : data) {
+			if (!item.is_array() || item.size() < 4) 
+				continue;
+			auto refID = dh->LookupFormID(ParseHex(item[0].get<std::string>()), item[1].get<std::string>());
+			if (!refID) 
+				continue;
+
+			auto cellMod = item[3].get<std::string>();
+			if (cellMod.empty()) { 
+				persistentRefs.push_back(refID);
+				continue; 
+			}   // persistent
+
+			auto cellID = dh->LookupFormID(ParseHex(item[2].get<std::string>()), cellMod);
+			if (cellID)
+				cellRefMap[cellID].push_back(refID);
+			else       
+				persistentRefs.push_back(refID);   // cell gone -> fall back to load sweep
+		}
+	}
+	logger::info("BuildDatabase: {} cells, {} persistent", cellRefMap.size(), persistentRefs.size());
+}
+
+// Disable every tracked ref currently in memory (used after a load/transfer completes).
+void ApplyAllLoaded() {
+	if (allObjectsEnabled) 
+		return;
+
+	for (auto& [cell, refs] : cellRefMap){
+		for (auto refID : refs){
+			if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID))
+				ref->Disable();
+		}
+	}
+	
+	for (auto refID : persistentRefs){
+		if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID))
+			ref->Disable();
+	}
+}
 /////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -226,7 +324,7 @@ void SetForEachFile(bool enable) {
 
 void RunCommands(std::vector<std::string>& args, std::string& command) {
     const auto& cmd = args[0];
-
+	/*
     if (cmd == "p") {
         command = "disable";
         auto selectedObj = RE::Console::GetSelectedRef();
@@ -250,6 +348,42 @@ void RunCommands(std::vector<std::string>& args, std::string& command) {
             cachedChanges.erase(cachedChanges.begin());
         cachedChanges.push_back({selectedObj->formID, fileName});
     } 
+	*/
+	if (cmd == "p") {
+		command = "disable";
+		auto selectedObj = RE::Console::GetSelectedRef();
+		if (!selectedObj) { 
+			logger::warn("No object selected"); 
+			return; 
+		}
+
+		auto fileName = defaultListName;
+		if (args.size() >= 3 && args[1] == "n") 
+			fileName = args[2];
+
+		auto* basePlugin = selectedObj->GetFile(0);
+		if (!basePlugin) { 
+			logger::warn("Dynamic ref, skipping"); 
+			command = fillerCommand; 
+			return; 
+		}
+
+		auto* cell = selectedObj->GetParentCell();
+		auto* cellPlugin = cell ? cell->GetFile(0) : nullptr;
+
+		if (cellPlugin) {                                   // non persistent ref
+			SaveObjectState(selectedObj->GetLocalFormID(), basePlugin->GetFilename(), cell->GetLocalFormID(), cellPlugin->GetFilename(), fileName);
+			cellRefMap[cell->GetFormID()].push_back(selectedObj->formID);
+		}
+		else {                                            // persistent ref - always loaded
+			SaveObjectState(selectedObj->GetLocalFormID(), basePlugin->GetFilename(), 0, "", fileName);  // empty cell mod = persistent marker
+			persistentRefs.push_back(selectedObj->formID);
+		}
+
+		if (cachedChanges.size() == 10) 
+			cachedChanges.erase(cachedChanges.begin());
+		cachedChanges.push_back({ selectedObj->formID, cell ? cell->GetFormID() : 0, fileName });
+	}
     else if (cmd == "toggle") {
         command = fillerCommand;
         if (args.size() < 2) { // Toggle all
@@ -262,6 +396,7 @@ void RunCommands(std::vector<std::string>& args, std::string& command) {
                 logger::error("Invalid object 0");
         }
     } 
+	/*
     else if (cmd == "undo") {
         command = fillerCommand;
         if (cachedChanges.empty()) {
@@ -284,6 +419,37 @@ void RunCommands(std::vector<std::string>& args, std::string& command) {
         else
             ClearFile(args[1]);
     }
+	*/
+	else if (cmd == "undo") {
+		command = fillerCommand;
+		if (cachedChanges.empty()) { 
+			logger::error("Nothing to undo"); 
+			return; 
+		}
+
+		auto item = cachedChanges.back();
+		if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(item.refID))
+			if (ref->IsDisabled()) 
+				ref->Enable(false);
+
+		std::erase(persistentRefs, item.refID);
+		if (auto it = cellRefMap.find(item.cellID); it != cellRefMap.end()) {
+			auto& refList = it->second;
+			refList.erase(std::remove(refList.begin(), refList.end(), item.refID), refList.end());
+			if (refList.empty()) 
+				cellRefMap.erase(it);
+		}
+
+		if (!item.list.empty()) 
+			PopObjectFromFile(item.list);
+		cachedChanges.pop_back();
+	}
+	else if (cmd == "clear") {
+		command = fillerCommand;
+		if (args.size() < 2) { BackupAllFiles(); ClearAllFiles(); }
+		else ClearFile(args[1]);
+		BuildDatabase();   // index now reflects the cleared files
+	}
     else {
        // Dont set a command so we fall through to default game warning
         logger::error("Unknown command: {}", cmd);
@@ -313,14 +479,23 @@ struct Hooks
                         args.emplace_back(tok);  // not flags
                     }
                 }
-
+				/*
                 if (args.empty()) {
                      if (auto sel = RE::Console::GetSelectedRef()) {
                          if (cachedChanges.size() == 10) 
                              cachedChanges.erase(cachedChanges.begin());
                          cachedChanges.push_back({sel->formID, ""});
                      }
-                 } else {
+                 } 
+				 */
+				if (args.empty()) {
+					if (auto sel = RE::Console::GetSelectedRef()) {
+						auto* cell = sel->GetParentCell();
+						if (cachedChanges.size() == 10) 
+							cachedChanges.erase(cachedChanges.begin());
+						cachedChanges.push_back({ sel->formID, cell ? cell->GetFormID() : 0, "" });
+					}
+				} else {
                      RunCommands(args, command);
                  }
 
@@ -365,7 +540,8 @@ public:
 		if (a_event && a_event->type == RE::PositionPlayerEvent::EVENT_TYPE::kFinish) { // firest post cell loading
 			logger::info("Game Loaded"); //fires for coc, fast travel
 			inTransfer = false;
-			SetForEachFile(false);
+			//SetForEachFile(false);
+			ApplyAllLoaded();
 		}
 
 		return RE::BSEventNotifyControl::kContinue;
@@ -388,6 +564,7 @@ public:
 class CellFullyLoadedEventHandler : public RE::BSTEventSink<RE::TESCellFullyLoadedEvent>
 {
 public:
+/*
 	virtual RE::BSEventNotifyControl ProcessEvent(const RE::TESCellFullyLoadedEvent* a_event, RE::BSTEventSource<RE::TESCellFullyLoadedEvent>*) {
 		logger::info("Cell fully loaded msg");
 		
@@ -402,6 +579,26 @@ public:
 				logger::info("Setting base object state - CellFullyLoadedEventHandler");
 				SetForEachFile(false);
 			}
+		}
+
+		return RE::BSEventNotifyControl::kContinue;
+	}
+	*/
+	virtual RE::BSEventNotifyControl ProcessEvent(const RE::TESCellFullyLoadedEvent* a_event, RE::BSTEventSource<RE::TESCellFullyLoadedEvent>*) {
+		if (!a_event || !a_event->cell) return RE::BSEventNotifyControl::kContinue;
+
+		static bool init = true;
+		if (init) {
+			init = false; PositionPlayerEventHandler::Register(); 
+		}
+
+		if (inTransfer || allObjectsEnabled) 
+			return RE::BSEventNotifyControl::kContinue;
+
+		if (auto it = cellRefMap.find(a_event->cell->GetFormID()); it != cellRefMap.end()) {
+			for (auto refID : it->second)
+				if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID))
+					ref->Disable();
 		}
 
 		return RE::BSEventNotifyControl::kContinue;
@@ -435,10 +632,15 @@ void SetupLogger() {
     spdlog::set_default_logger(std::move(loggerPtr));
 }
 
+
 void MessageHandler(SKSE::MessagingInterface::Message* message)
 {
 	logger::info("Message: {}", message->data);
-    if (message->type == SKSE::MessagingInterface::kPostPostLoad) {
+
+	if(message->type == SKSE::MessagingInterface::kDataLoaded){ // CAN BE DONE AT kPostPostLoad ??
+		BuildDatabase();
+	}
+    else if (message->type == SKSE::MessagingInterface::kPostPostLoad) {
         logger::info("Game version: {}", REL::Module::get().version().string()); 
 
 		// Setup base file path
@@ -454,13 +656,43 @@ void MessageHandler(SKSE::MessagingInterface::Message* message)
 
         Hooks::Install();
     }
-	if (message->type == SKSE::MessagingInterface::kPostLoadGame) {
+	else if (message->type == SKSE::MessagingInterface::kPostLoadGame) {
 		logger::info("Game version: {}", REL::Module::get().version().string());
 		logger::info("Game Loaded");
 		SetForEachFile(false);
+	} 
+	else if(message->type == SKSE::MessagingInterface::kPreLoadGame || message->type == SKSE::MessagingInterface::kNewGame){
+		inTransfer = true;
 	}
 }
 
+// Rubbish PROBS
+/*
+void MessageHandler(SKSE::MessagingInterface::Message* message) {
+	switch (message->type) {
+	case SKSE::MessagingInterface::kPostPostLoad:
+		basePath = std::filesystem::current_path() / "Data" / "SKSE" / "Plugins" / "DisabledObjects";
+		if (!std::filesystem::is_directory(basePath)) std::filesystem::create_directories(basePath);
+		CellFullyLoadedEventHandler::Register();
+		Hooks::Install();
+		break;
+
+	case SKSE::MessagingInterface::kDataLoaded:
+		BuildDatabase();              // load order is fixed now; index valid for the whole session
+		break;
+
+	case SKSE::MessagingInterface::kPreLoadGame:
+		inTransfer = true;            // suppress cell handler while the load streams cells
+		break;
+
+	case SKSE::MessagingInterface::kPostLoadGame:
+	case SKSE::MessagingInterface::kNewGame:
+		inTransfer = false;
+		ApplyAllLoaded();
+		break;
+	}
+}
+*/
 
 SKSEPluginInfo(.Version = REL::Version{1,0,0}, .Name = "Object Disabler", .Author = "Dawntic", .StructCompatibility = SKSE::StructCompatibility::Independent, .RuntimeCompatibility = SKSE::VersionIndependence::AddressLibrary)
 
