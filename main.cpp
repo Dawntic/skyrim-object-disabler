@@ -10,19 +10,9 @@ std::filesystem::path basePath;
 const std::string fillerCommand = "SSG"; // stripped game func - repurpose as inline nop
 
 bool allObjectsEnabled = false;
-
-// Tracked refs grouped by the cell they live in (non-persistent). The value is the DESIRED enabled state
-// (false = should be disabled, the normal state for a tracked object; true = re-enabled via a toggle).
-// Keeping the desired state in memory is the core of the fix: it lets UpdatePerCell re-apply the correct
-// state when a cell finishes loading, even for refs whose cell isn't currently loaded - the engine only
-// resolves a ref pointer (LookupByID) while its cell is loaded, so we can't touch unloaded refs directly.
-std::unordered_map<RE::FormID, std::unordered_map<RE::FormID, bool>> cellRefMap; // cellID -> { refID -> enabled }
-std::unordered_map<RE::FormID, bool> persistentRefs;                              // refID -> enabled (always loaded)
-
-// One-shot enables for refs whose cell is unloaded (e.g. cleared while the player is away). Drained the
-// next time the owning cell finishes loading. Lives outside cellRefMap so it survives BuildDatabase, which
-// rebuilds cellRefMap from the (now emptied) json files after a clear.
-std::unordered_map<RE::FormID, std::vector<RE::FormID>> pendingEnable; // cellID -> refIDs to enable on load
+std::unordered_map<RE::FormID, std::unordered_map<RE::FormID, bool>> cellRefMap;
+std::unordered_map<RE::FormID, bool> persistentRefs;                      
+std::unordered_map<RE::FormID, std::vector<RE::FormID>> pendingEnable;
 
 struct CachedChange {
 	RE::FormID refID; 
@@ -152,8 +142,11 @@ void SaveObjectState(const ObjectID& object, std::string saveFileName) {
 	auto encoded = json::array({ std::format("{:X}", object.formID), std::format("{:X}", object.cellID), object.refMaster, object.cellMaster });
 	data.push_back(encoded);
 
-	if (!WriteFile(file, data))
+	if (WriteFile(file, data))
+		logger::debug("Saved object: {} | {} cell: {} | {}", std::string(encoded[0]), std::string(encoded[1]), std::string(encoded[2]), std::string(encoded[3]));
+	else
 		logger::error("[SaveObjectState] Failed to save object to file: {}", file.string());
+
 }
 
 // drop the last element for a given file
@@ -168,9 +161,6 @@ void PopObjectFromFile(std::string saveFileName) {
     }
 }
 
-// Iterate a specific file and resolve each object to its runtime ids. The callback receives the resolved
-// ref formID, the owning cell formID (0 for persistent refs / cells that no longer exist) and the live ref
-// pointer, which is null when the object's cell isn't currently loaded.
 void ForEachResolvedObject(std::string name, std::function<void(RE::FormID refID, RE::FormID cellID, RE::TESObjectREFR*)> callback) {
 	auto file = basePath / (name + ".json");
 
@@ -195,47 +185,12 @@ void ForEachResolvedObject(std::string name, std::function<void(RE::FormID refID
 			continue;
 		}
 
-		RE::FormID cellID = 0; // persistent ref, or cell master missing -> treat as persistent
+		RE::FormID cellID = 0;
 		if (!object.cellMaster.empty())
 			cellID = dataHandler->LookupFormID(object.cellID, object.cellMaster);
 
 		callback(refID, cellID, RE::TESForm::LookupByID<RE::TESObjectREFR>(refID));
 	}
-}
-
-// Desired enabled state of a file's first object, read from the in-memory index so it works even when the
-// object's cell isn't loaded. nullopt means the file is empty or its first object can't be resolved.
-std::optional<bool> GetFileFirstState(std::string name) {
-	auto file = basePath / (name + ".json");
-
-	json jsonData;
-	if (!ReadFile(file, jsonData) || jsonData.empty())
-		return std::nullopt;
-
-	auto* dataHandler = RE::TESDataHandler::GetSingleton();
-	if (!dataHandler) {
-		logger::error("Invalid data handler");
-		return std::nullopt;
-	}
-
-	ObjectID object;
-	if (!ObjectFromJson(jsonData[0], object))
-		return std::nullopt;
-
-	auto refID = dataHandler->LookupFormID(object.formID, object.refMaster);
-	if (!refID)
-		return std::nullopt;
-
-	if (object.cellMaster.empty()) {
-		if (auto it = persistentRefs.find(refID); it != persistentRefs.end())
-			return it->second;
-	} else if (auto cellID = dataHandler->LookupFormID(object.cellID, object.cellMaster)) {
-		if (auto it = cellRefMap.find(cellID); it != cellRefMap.end())
-			if (auto rit = it->second.find(refID); rit != it->second.end())
-				return rit->second;
-	}
-
-	return false; // tracked objects default to disabled
 }
 
 void ClearFile(std::string saveFileName) {
@@ -246,9 +201,7 @@ void ClearFile(std::string saveFileName) {
 		return;
 	}
 
-	// Re-enable every object in the file. Loaded refs are enabled immediately; refs in unloaded cells are
-	// queued so they get enabled the next time their cell loads (BuildDatabase below would otherwise drop
-	// them, leaving them disabled forever).
+	// Set cleared items to be enabled
 	ForEachResolvedObject(saveFileName, [](RE::FormID refID, RE::FormID cellID, RE::TESObjectREFR* ref) {
 		if (ref)
 			EnableObj(ref);
@@ -318,10 +271,9 @@ void BuildDatabase() {
 	logger::info("[BuildDatabase] Processed {} cells", cellRefMap.size());
 }
 
-// Re-apply the stored desired state to every currently-loaded tracked ref, and flush any pending enables
-// that have since become loaded. Does not change desired state, so it preserves active toggles across a
-// fast travel / coc transfer.
-void ApplyAllLoaded() {
+void SetAllLoadedObjectState() {
+	logger::debug("Set loaded object state");
+
 	for (auto it = pendingEnable.begin(); it != pendingEnable.end();) {
 		std::erase_if(it->second, [](RE::FormID refID) {
 			if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID)) {
@@ -343,8 +295,6 @@ void ApplyAllLoaded() {
 			enabled ? EnableObj(ref) : DisableObj(ref);
 }
 
-// Set the desired state for every tracked ref, then apply it to the ones currently loaded. Unloaded refs
-// pick up the new state from cellRefMap when their cell loads (see UpdatePerCell).
 void SetAllObjectState(bool enable) {
 	for (auto& [cell, refs] : cellRefMap)
 		for (auto& [refID, enabled] : refs)
@@ -353,14 +303,21 @@ void SetAllObjectState(bool enable) {
 	for (auto& [refID, enabled] : persistentRefs)
 		enabled = enable;
 
-	ApplyAllLoaded();
+	SetAllLoadedObjectState();
 }
 
 void UpdatePerCell(const RE::TESCellFullyLoadedEvent* event)
 {
 	auto cellID = event->cell->GetFormID();
 
-	// Drain one-shot enables queued while this cell was unloaded (e.g. from a clear).
+	// There must be a better way than this
+	for (auto& [refID, enabled] : persistentRefs){
+		if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID)){
+			enabled ? EnableObj(ref) : DisableObj(ref);
+		}
+	}
+
+	// pending items won't be in cell ref map
 	if (auto it = pendingEnable.find(cellID); it != pendingEnable.end()) {
 		for (auto refID : it->second)
 			if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID))
@@ -368,7 +325,6 @@ void UpdatePerCell(const RE::TESCellFullyLoadedEvent* event)
 		pendingEnable.erase(it);
 	}
 
-	// Apply the desired state for the refs tracked in this cell.
 	if (auto it = cellRefMap.find(cellID); it != cellRefMap.end()) {
 		for (auto& [refID, enabled] : it->second){
 			if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID)){
@@ -379,6 +335,42 @@ void UpdatePerCell(const RE::TESCellFullyLoadedEvent* event)
 			}
 		}
 	}
+}
+
+// Desired enabled state of a file's first object, read from the in-memory index so it works even when the
+// object's cell isn't loaded. nullopt means the file is empty or its first object can't be resolved.
+std::optional<bool> GetFileFirstState(std::string name) {
+	auto file = basePath / (name + ".json");
+
+	json jsonData;
+	if (!ReadFile(file, jsonData) || jsonData.empty())
+		return std::nullopt;
+
+	auto* dataHandler = RE::TESDataHandler::GetSingleton();
+	if (!dataHandler) {
+		logger::error("Invalid data handler");
+		return std::nullopt;
+	}
+
+	ObjectID object;
+	if (!ObjectFromJson(jsonData[0], object))
+		return std::nullopt;
+
+	auto refID = dataHandler->LookupFormID(object.formID, object.refMaster);
+	if (!refID)
+		return std::nullopt;
+
+	if (object.cellMaster.empty()) {
+		if (auto it = persistentRefs.find(refID); it != persistentRefs.end())
+			return it->second;
+	}
+	else if (auto cellID = dataHandler->LookupFormID(object.cellID, object.cellMaster)) {
+		if (auto it = cellRefMap.find(cellID); it != cellRefMap.end())
+			if (auto rit = it->second.find(refID); rit != it->second.end())
+				return rit->second;
+	}
+
+	return false; // tracked objects default to disabled
 }
 /////////////////////////////////////////////////////////////////////////////////////////
 
@@ -441,12 +433,10 @@ void RunCommands(std::vector<std::string>& args, std::string& command) {
 
             bool enable = !*state; // flip the file's current desired state
             ForEachResolvedObject(args[1], [enable](RE::FormID refID, RE::FormID cellID, RE::TESObjectREFR* ref) {
-                // Update the stored desired state so unloaded refs are corrected when their cell loads...
                 if (cellID)
                     cellRefMap[cellID][refID] = enable;
                 else
                     persistentRefs[refID] = enable;
-                // ...and apply immediately to anything already loaded.
                 if (ref)
                     enable ? EnableObj(ref) : DisableObj(ref);
             });
@@ -563,11 +553,9 @@ public:
 			inTransfer = true;
 		}
 		
-		if (a_event && a_event->type == RE::PositionPlayerEvent::EVENT_TYPE::kFinish) { // first post cell loading
-			logger::info("Game version: {}", REL::Module::get().version().string());
-			logger::info("Game Loaded - via kFinish"); //fires for coc, fast travel
+		if (a_event && a_event->type == RE::PositionPlayerEvent::EVENT_TYPE::kFinish) { //fires for coc, fast travel
 			inTransfer = false;
-			ApplyAllLoaded(); // re-assert current desired states for the newly loaded cells (keeps toggles)
+			SetAllLoadedObjectState();
 		}
 
 		return RE::BSEventNotifyControl::kContinue;
@@ -684,13 +672,11 @@ void MessageHandler(SKSE::MessagingInterface::Message* message)
 		logger::info("Game Loaded - via kPostLoadGame");
 		inTransfer = false;
 		allObjectsEnabled = false;
-		pendingEnable.clear();
 		SetAllObjectState(false);
 	}
 	else if(message->type == SKSE::MessagingInterface::kPreLoadGame || message->type == SKSE::MessagingInterface::kNewGame){
 		inTransfer = true;
 		allObjectsEnabled = false;
-		pendingEnable.clear();
 	}
 }
 
