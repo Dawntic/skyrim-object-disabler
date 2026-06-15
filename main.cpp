@@ -143,10 +143,9 @@ void SaveObjectState(const ObjectID& object, std::string saveFileName) {
 	data.push_back(encoded);
 
 	if (WriteFile(file, data))
-		logger::debug("Saved object: {} | {} cell: {} | {}", std::string(encoded[0]), std::string(encoded[1]), std::string(encoded[2]), std::string(encoded[3]));
+		logger::debug("Saved object: {} | {} cell: {} | {}", std::string(encoded[0]), std::string(encoded[2]), std::string(encoded[1]), std::string(encoded[3]));
 	else
 		logger::error("[SaveObjectState] Failed to save object to file: {}", file.string());
-
 }
 
 // drop the last element for a given file
@@ -306,16 +305,19 @@ void SetAllObjectState(bool enable) {
 	SetAllLoadedObjectState();
 }
 
+// when item is first disabled by user we can check what cell it was in and store that
+// when loading cells just check like any other ref
+
 void UpdatePerCell(const RE::TESCellFullyLoadedEvent* event)
 {
 	auto cellID = event->cell->GetFormID();
 
 	// There must be a better way than this
-	for (auto& [refID, enabled] : persistentRefs){
-		if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID)){
-			enabled ? EnableObj(ref) : DisableObj(ref);
-		}
-	}
+	//for (auto& [refID, enabled] : persistentRefs){
+	//	if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID)){
+	//		enabled ? EnableObj(ref) : DisableObj(ref);
+	//	}
+	//}
 
 	// pending items won't be in cell ref map
 	if (auto it = pendingEnable.find(cellID); it != pendingEnable.end()) {
@@ -401,17 +403,29 @@ void RunCommands(std::vector<std::string>& args, std::string& command) {
 		}
 
 		auto* cell = selectedObj->GetParentCell();
-		auto* cellPlugin = cell ? cell->GetFile(0) : nullptr;
+		if(!cell){
+			logger::error("Failed to get ref parent cell");
+			return;
+		}
+
+		auto* cellMaster = cell->GetFile(0);
+		if(!cellMaster){ // is persistent ref
+			auto tes = RE::TES::GetSingleton();
+			cell = tes->GetCell(selectedObj->GetPosition());
+			cellMaster = cell ? cell->GetFile(0) : nullptr;
+			logger::info("persistent ref cell: {} {}", cell->GetFormID(), cellMaster->GetFilename());
+		}
 		
 		ObjectID object = { .formID = selectedObj->GetLocalFormID(), .refMaster = std::string(basePlugin->GetFilename()) }; 
-		if (cellPlugin) { // non persistent ref
+		if (cellMaster) { // non persistent ref
 			object.cellID = cell->GetLocalFormID();
-			object.cellMaster = std::string(cellPlugin->GetFilename());
+			object.cellMaster = std::string(cellMaster->GetFilename());
 			cellRefMap[cell->GetFormID()][selectedObj->formID] = false;
-		} else { // persistent ref
-			object.cellID = 0;
-			object.cellMaster = "";
-			persistentRefs[selectedObj->formID] = false;
+		} else { 
+			logger::info("Failed r");
+		//	object.cellID = 0;
+		//	object.cellMaster = "";
+		//	persistentRefs[selectedObj->formID] = false;
 		}
 		SaveObjectState(object, fileName);
 
@@ -519,7 +533,6 @@ struct Hooks
             }
 
             func(script, unk, unk2, unk3);
-
         };
 
         static inline REL::Relocation<decltype(thunk)> func;
@@ -617,11 +630,10 @@ bool LoadDebugSetting() {
 
 	CSimpleIniA ini;
 	ini.SetUnicode();
-	ini.LoadFile(path.string().c_str());                 // missing file -> ini just stays empty
+	ini.LoadFile(path.string().c_str());              
 
 	bool debug = ini.GetBoolValue("Debug", "EnableDebugLog", false);
 
-	// write the key back: creates the file with the default if absent, preserves user edits otherwise
 	ini.SetBoolValue("Debug", "EnableDebugLog", debug);
 	ini.SaveFile(path.string().c_str());
 
@@ -659,13 +671,12 @@ void MessageHandler(SKSE::MessagingInterface::Message* message)
 			std::filesystem::create_directories(basePath);
 			logger::info("Creating base folder...");
 		}
-
 		logger::info("Base folder location: {}", basePath.lexically_relative(std::filesystem::current_path()).string());
 
-		// Register here since player ptr will be valid
-		CellFullyLoadedEventHandler::Register();	
-
         Hooks::Install();
+
+		// Register here since player ptr will be valid by now
+		CellFullyLoadedEventHandler::Register();
     }
 	else if (message->type == SKSE::MessagingInterface::kPostLoadGame) {
 		logger::info("Game version: {}", REL::Module::get().version().string());
