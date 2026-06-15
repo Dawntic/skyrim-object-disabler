@@ -11,13 +11,13 @@ const std::string fillerCommand = "SSG"; // stripped game func - repurpose as in
 
 bool allObjectsEnabled = false;
 
-// Tracked refs grouped by the cell they live in (non-persistent). The value is the DESIRED enabled state
-// (false = should be disabled, the normal state for a tracked object; true = re-enabled via a toggle).
-// Keeping the desired state in memory is the core of the fix: it lets UpdatePerCell re-apply the correct
-// state when a cell finishes loading, even for refs whose cell isn't currently loaded - the engine only
-// resolves a ref pointer (LookupByID) while its cell is loaded, so we can't touch unloaded refs directly.
-std::unordered_map<RE::FormID, std::unordered_map<RE::FormID, bool>> cellRefMap; // cellID -> { refID -> enabled }
-std::unordered_map<RE::FormID, bool> persistentRefs;                              // refID -> enabled (always loaded)
+// Tracked refs grouped by the cell they live in. The value is the DESIRED enabled state (false = should be
+// disabled, the normal state for a tracked object; true = re-enabled via a toggle). Keeping the desired
+// state in memory lets UpdatePerCell re-apply the correct state when a cell finishes loading, even for refs
+// whose cell isn't currently loaded - the engine only resolves a ref pointer (LookupByID) while its cell is
+// loaded. Persistent refs are always loaded and have no owning cell to wait on, so they live under the
+// sentinel cellID 0 and are only ever touched by the global sweeps (SetAllObjectState / ApplyAllLoaded).
+std::unordered_map<RE::FormID, std::unordered_map<RE::FormID, bool>> cellRefMap; // cellID (0 = persistent) -> { refID -> enabled }
 
 // One-shot enables for refs whose cell is unloaded (e.g. cleared while the player is away). Drained the
 // next time the owning cell finishes loading. Lives outside cellRefMap so it survives BuildDatabase, which
@@ -226,14 +226,13 @@ std::optional<bool> GetFileFirstState(std::string name) {
 	if (!refID)
 		return std::nullopt;
 
-	if (object.cellMaster.empty()) {
-		if (auto it = persistentRefs.find(refID); it != persistentRefs.end())
-			return it->second;
-	} else if (auto cellID = dataHandler->LookupFormID(object.cellID, object.cellMaster)) {
-		if (auto it = cellRefMap.find(cellID); it != cellRefMap.end())
-			if (auto rit = it->second.find(refID); rit != it->second.end())
-				return rit->second;
-	}
+	RE::FormID cellID = 0; // persistent ref -> sentinel 0
+	if (!object.cellMaster.empty())
+		cellID = dataHandler->LookupFormID(object.cellID, object.cellMaster);
+
+	if (auto it = cellRefMap.find(cellID); it != cellRefMap.end())
+		if (auto rit = it->second.find(refID); rit != it->second.end())
+			return rit->second;
 
 	return false; // tracked objects default to disabled
 }
@@ -272,7 +271,6 @@ void ClearAllFiles() {
 // Combine json files into one place
 void BuildDatabase() {
 	cellRefMap.clear();
-	persistentRefs.clear();
 	auto* dataHandler = RE::TESDataHandler::GetSingleton();
 	if (!dataHandler) { 
 		logger::error("BuildDatabase: no data handler"); 
@@ -299,19 +297,16 @@ void BuildDatabase() {
 				continue;
 			}
 
-			// persistent ref (desired state defaults to disabled)
-			if (object.cellMaster.empty()) {
-				persistentRefs[formID] = false;
-				continue;
+			// Persistent refs (empty cell master) use the sentinel cellID 0. A non-persistent ref whose
+			// cell can't be resolved falls back to the same sentinel so it's still caught by the load sweep.
+			RE::FormID cellID = 0;
+			if (!object.cellMaster.empty()) {
+				cellID = dataHandler->LookupFormID(object.cellID, object.cellMaster);
+				if (!cellID)
+					logger::warn("[BuildDatabase] Form {} has invalid cellID: {} | {} - treating as persistent ref", object.formID, object.cellID, object.cellMaster);
 			}
 
-			auto cellID = dataHandler->LookupFormID(object.cellID, object.cellMaster);
-			if (cellID)
-				cellRefMap[cellID][formID] = false;
-			else{
-				logger::warn("[BuildDatabase] Form {} has invalid cellID: {} | {} - treating as persistent ref", object.formID, object.cellID, object.cellMaster);
-				persistentRefs[formID] = false;   // cell gone -> fall back to load sweep
-			}
+			cellRefMap[cellID][formID] = false; // desired state defaults to disabled
 		}
 	}
 
@@ -337,10 +332,6 @@ void ApplyAllLoaded() {
 		for (auto& [refID, enabled] : refs)
 			if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID))
 				enabled ? EnableObj(ref) : DisableObj(ref);
-
-	for (auto& [refID, enabled] : persistentRefs)
-		if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID))
-			enabled ? EnableObj(ref) : DisableObj(ref);
 }
 
 // Set the desired state for every tracked ref, then apply it to the ones currently loaded. Unloaded refs
@@ -349,9 +340,6 @@ void SetAllObjectState(bool enable) {
 	for (auto& [cell, refs] : cellRefMap)
 		for (auto& [refID, enabled] : refs)
 			enabled = enable;
-
-	for (auto& [refID, enabled] : persistentRefs)
-		enabled = enable;
 
 	ApplyAllLoaded();
 }
@@ -411,21 +399,22 @@ void RunCommands(std::vector<std::string>& args, std::string& command) {
 		auto* cell = selectedObj->GetParentCell();
 		auto* cellPlugin = cell ? cell->GetFile(0) : nullptr;
 		
-		ObjectID object = { .formID = selectedObj->GetLocalFormID(), .refMaster = std::string(basePlugin->GetFilename()) }; 
+		ObjectID object = { .formID = selectedObj->GetLocalFormID(), .refMaster = std::string(basePlugin->GetFilename()) };
+		RE::FormID trackCellID = 0; // persistent refs are tracked under the sentinel cellID 0
 		if (cellPlugin) { // non persistent ref
 			object.cellID = cell->GetLocalFormID();
 			object.cellMaster = std::string(cellPlugin->GetFilename());
-			cellRefMap[cell->GetFormID()][selectedObj->formID] = false;
+			trackCellID = cell->GetFormID();
 		} else { // persistent ref
 			object.cellID = 0;
 			object.cellMaster = "";
-			persistentRefs[selectedObj->formID] = false;
 		}
+		cellRefMap[trackCellID][selectedObj->formID] = false;
 		SaveObjectState(object, fileName);
 
-		if (cachedChanges.size() == 10) 
+		if (cachedChanges.size() == 10)
 			cachedChanges.erase(cachedChanges.begin());
-		cachedChanges.push_back({ selectedObj->formID, cell ? cell->GetFormID() : 0, fileName });
+		cachedChanges.push_back({ selectedObj->formID, trackCellID, fileName });
 	}
     else if (cmd == "toggle") {
         command = fillerCommand;
@@ -441,11 +430,9 @@ void RunCommands(std::vector<std::string>& args, std::string& command) {
 
             bool enable = !*state; // flip the file's current desired state
             ForEachResolvedObject(args[1], [enable](RE::FormID refID, RE::FormID cellID, RE::TESObjectREFR* ref) {
-                // Update the stored desired state so unloaded refs are corrected when their cell loads...
-                if (cellID)
-                    cellRefMap[cellID][refID] = enable;
-                else
-                    persistentRefs[refID] = enable;
+                // Update the stored desired state so unloaded refs are corrected when their cell loads
+                // (cellID 0 = persistent)...
+                cellRefMap[cellID][refID] = enable;
                 // ...and apply immediately to anything already loaded.
                 if (ref)
                     enable ? EnableObj(ref) : DisableObj(ref);
@@ -464,7 +451,6 @@ void RunCommands(std::vector<std::string>& args, std::string& command) {
 			if (ref->IsDisabled()) 
 				ref->Enable(false);
 
-		persistentRefs.erase(item.refID);
 		if (auto it = cellRefMap.find(item.cellID); it != cellRefMap.end()) {
 			it->second.erase(item.refID);
 			if (it->second.empty())
